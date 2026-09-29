@@ -73,3 +73,42 @@ export const decodeBase64 = (str: string): string => {
     return "Error decoding file content. It might be binary or too large.";
   }
 };
+
+/**
+ * Fetch the full recursive file tree of a repo's default branch in one call.
+ * Returns file paths (blobs only). Large repos may come back truncated.
+ */
+export const fetchRepoTree = async (
+  owner: string,
+  repo: string,
+  branch: string,
+  options: RequestOptions = {}
+): Promise<{ paths: string[]; truncated: boolean }> => {
+  const headers: HeadersInit = {
+    'Accept': 'application/vnd.github.v3+json',
+  };
+  if (options.token) {
+    headers['Authorization'] = `token ${options.token}`;
+  }
+
+  // Resolve the branch -> tree sha
+  const branchRes = await fetch(`${BASE_URL}/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`, { headers });
+  if (!branchRes.ok) {
+    throw new Error(`Failed to resolve branch ${branch}`);
+  }
+  const branchData = await branchRes.json();
+  const treeSha: string | undefined = branchData?.commit?.commit?.tree?.sha;
+  if (!treeSha) {
+    throw new Error('Could not resolve repository tree.');
+  }
+
+  const treeRes = await fetch(`${BASE_URL}/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`, { headers });
+  if (!treeRes.ok) {
+    throw new Error('Failed to fetch repository tree.');
+  }
+  const treeData = await treeRes.json();
+  const paths: string[] = (treeData.tree || [])
+    .filter((e: { type: string }) => e.type === 'blob')
+    .map((e: { path: string }) => e.path);
+  return { paths, truncated: !!treeData.truncated };
+};

@@ -1,72 +1,124 @@
-import { GoogleGenAI, Chat, GenerateContentResponse } from "@google/genai";
+// All Gemini calls go through Cody's server-side proxy, so the Gemini API key
+// never ships to the browser. The proxy (POST /repogenius/gemini/*) owns the
+// prompt templates and holds the key in server-side env only.
+//
+// Override the proxy location with VITE_GEMINI_PROXY_URL (e.g. for local dev).
 
+const PROXY_BASE = (
+  (import.meta.env.VITE_GEMINI_PROXY_URL as string | undefined) ||
+  "https://jessica-voice-line.netlify.app"
+).replace(/\/$/, "");
 
-// Initialize the API client
-// Note: In a real production app, ensure this key is handled securely (e.g. backend proxy).
-// Since this is a client-side demo instructions, we access env directly.
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+export interface ChatTurn {
+  role: "user" | "model";
+  text: string;
+}
 
-export const createChatSession = (systemInstruction: string): Chat => {
-  return ai.chats.create({
-    model: 'gemini-3-flash-preview',
-    config: {
-      systemInstruction,
-    },
-  });
-};
+export interface ChatSession {
+  systemInstruction: string;
+  history: ChatTurn[];
+}
 
-export const sendMessageToGemini = async (chat: Chat, message: string): Promise<string> => {
+/** Shared repo context sent with one-shot analyses so the proxy can ground them. */
+export interface RepoContext {
+  tree: string[];       // file paths, client-capped
+  packageJson: string;  // raw package.json, client-capped
+  readme: string;       // README excerpt, client-capped
+}
+
+const MAX_TREE_PATHS = 400;
+const MAX_PACKAGE_JSON = 4000;
+const MAX_README = 4000;
+const MAX_CODE = 20000;
+const MAX_HISTORY_TURNS = 20;
+
+export function buildRepoContext(
+  tree: string[],
+  packageJson: string,
+  readme: string
+): RepoContext {
+  return {
+    tree: tree.slice(0, MAX_TREE_PATHS),
+    packageJson: packageJson.slice(0, MAX_PACKAGE_JSON),
+    readme: readme.slice(0, MAX_README),
+  };
+}
+
+async function postJson(path: string, body: unknown): Promise<string> {
+  let res: Response;
   try {
-    const result: GenerateContentResponse = await chat.sendMessage({ message });
-    return result.text || "No response generated.";
-  } catch (error) {
-    console.error("Gemini API Error:", error);
-    throw error;
-  }
-};
-
-export const generateSummary = async (repoName: string, readmeContent: string): Promise<string> => {
-  try {
-    const prompt = `
-      Analyze the following README content for the GitHub repository "${repoName}".
-      Provide a concise summary of what this project does, its key features, and primary tech stack.
-      Keep it under 200 words. Format with markdown.
-      
-      README Content:
-      ${readmeContent.substring(0, 10000)} 
-    `;
-    // Truncate to avoid massive context usage on huge readmes for this specific quick summary call
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
+    res = await fetch(`${PROXY_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
-    return response.text || "Could not generate summary.";
+  } catch {
+    throw new Error("Could not reach the AI service. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    if (res.status === 503) {
+      throw new Error("AI service is not configured yet. Please try again later.");
+    }
+    if (res.status === 429) {
+      throw new Error("Too many AI requests right now. Wait a bit and try again.");
+    }
+    throw new Error(`AI request failed (status ${res.status}).`);
+  }
+  const data = (await res.json()) as { text?: unknown };
+  if (typeof data.text !== "string" || !data.text) {
+    throw new Error("AI service returned an unexpected response.");
+  }
+  return data.text;
+}
+
+export const createChatSession = (systemInstruction: string): ChatSession => ({
+  systemInstruction,
+  history: [],
+});
+
+export const sendMessageToGemini = async (
+  chat: ChatSession,
+  message: string
+): Promise<string> => {
+  const text = await postJson("/repogenius/gemini/chat", {
+    systemInstruction: chat.systemInstruction,
+    history: chat.history.slice(-MAX_HISTORY_TURNS),
+    message,
+  });
+  chat.history.push({ role: "user", text: message }, { role: "model", text });
+  // Keep client-side history bounded too.
+  if (chat.history.length > MAX_HISTORY_TURNS * 2) {
+    chat.history = chat.history.slice(-MAX_HISTORY_TURNS * 2);
+  }
+  return text;
+};
+
+export const generateSummary = async (
+  repoName: string,
+  readmeContent: string
+): Promise<string> => {
+  try {
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "summary",
+      repoName,
+      readme: readmeContent.slice(0, 10000),
+    });
   } catch (error) {
     console.error("Summary Generation Error:", error);
     return "Failed to generate summary.";
   }
 };
 
-export const analyzeCode = async (fileName: string, code: string): Promise<string> => {
+export const analyzeCode = async (
+  fileName: string,
+  code: string
+): Promise<string> => {
   try {
-     const prompt = `
-      Analyze the following code file: ${fileName}.
-      1. Explain what this file does.
-      2. Identify any potential bugs or security risks (if obvious).
-      3. Suggest one improvement.
-      
-      Code:
-      \`\`\`
-      ${code.substring(0, 20000)}
-      \`\`\`
-    `;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "analyze",
+      fileName,
+      code: code.slice(0, MAX_CODE),
     });
-    return response.text || "Could not analyze code.";
   } catch (error) {
     console.error("Code Analysis Error:", error);
     return "Failed to analyze code.";
@@ -74,38 +126,73 @@ export const analyzeCode = async (fileName: string, code: string): Promise<strin
 };
 
 export const generateDeploymentGuide = async (
-    repoName: string, 
-    fileNames: string[], 
-    readme: string = '', 
-    packageJson: string = ''
+  repoName: string,
+  fileNames: string[],
+  readme: string = "",
+  packageJson: string = ""
 ): Promise<string> => {
   try {
-    const prompt = `
-      I have a GitHub repository named "${repoName}".
-      
-      File Structure (Root): ${fileNames.join(', ')}
-      
-      package.json Content:
-      ${packageJson ? packageJson.substring(0, 3000) : 'Not available'}
-      
-      README Content (Snippet):
-      ${readme ? readme.substring(0, 3000) : 'Not available'}
-
-      Task:
-      1. Precise Stack Identification: Identify the exact framework (e.g., React, Vue, Node.js), build tool (Vite, Webpack), and key libraries based on the package.json dependencies.
-      2. Deployment Prompt: Generate a detailed "System Prompt" that I can paste into an AI coding tool (like Google AI Studio) to instruct it to rebuild this specific application. This prompt must include the tech stack and core features described in the README.
-      3. Build Instructions: Provide the exact npm/yarn commands to install and run this locally.
-      
-      Format the response in Markdown. Use a code block for the "Deployment Prompt".
-    `;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "guide",
+      repoName,
+      fileNames,
+      readme: readme.slice(0, 3000),
+      packageJson: packageJson.slice(0, 3000),
     });
-    return response.text || "Could not generate deployment guide.";
   } catch (error) {
     console.error("Deployment Guide Error:", error);
     return "Failed to generate deployment guide.";
+  }
+};
+
+export const generateArchitecture = async (
+  repoName: string,
+  ctx: RepoContext
+): Promise<string> => {
+  try {
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "architecture",
+      repoName,
+      ...ctx,
+    });
+  } catch (error) {
+    console.error("Architecture Error:", error);
+    return "Failed to generate architecture overview.";
+  }
+};
+
+export const generateSecurityAudit = async (
+  repoName: string,
+  fileName: string,
+  code: string,
+  ctx: RepoContext
+): Promise<string> => {
+  try {
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "security",
+      repoName,
+      fileName,
+      code: code.slice(0, MAX_CODE),
+      ...ctx,
+    });
+  } catch (error) {
+    console.error("Security Audit Error:", error);
+    return "Failed to run security audit.";
+  }
+};
+
+export const generateOnboardingGuide = async (
+  repoName: string,
+  ctx: RepoContext
+): Promise<string> => {
+  try {
+    return await postJson("/repogenius/gemini/generate", {
+      kind: "onboarding",
+      repoName,
+      ...ctx,
+    });
+  } catch (error) {
+    console.error("Onboarding Guide Error:", error);
+    return "Failed to generate onboarding guide.";
   }
 };
