@@ -1,0 +1,5 @@
+{
+  "name": "RepoGenius by ƷBI",
+  "description": "Connect to any public GitHub repository and chat with it using Gemini AI. Analyze code, summarize READMEs, and explore file structures intelligently.",
+  "requestFramePermissions": []
+}
